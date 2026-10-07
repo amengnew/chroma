@@ -246,6 +246,7 @@ impl LocalHnswSegmentReader {
                                 id_map,
                                 index_init: true,
                                 deleted: false,
+                                replay_complete: false,
                                 failed: false,
                                 deleted_on_load: inspection
                                     .mapped_deleted_labels
@@ -302,6 +303,7 @@ impl LocalHnswSegmentReader {
                             id_map: IdMap::new(dimensionality),
                             index_init: true,
                             deleted: false,
+                            replay_complete: false,
                             failed: false,
                             deleted_on_load: HashSet::new(),
                             #[cfg(test)]
@@ -633,6 +635,7 @@ pub struct Inner {
     id_map: IdMap,
     index_init: bool,
     deleted: bool,
+    replay_complete: bool,
     /// A failed native mutation may have partially modified the shared graph.
     failed: bool,
     // Tombstones already present in native files ahead of the pickle.
@@ -655,6 +658,16 @@ pub struct LocalHnswIndex {
 }
 
 impl LocalHnswIndex {
+    /// Whether this loaded instance has successfully replayed its log tail.
+    pub async fn replay_complete(&self) -> bool {
+        self.inner.read().await.replay_complete
+    }
+
+    /// Update shared replay state. Newly loaded instances start incomplete.
+    pub async fn set_replay_complete(&self, complete: bool) {
+        self.inner.write().await.replay_complete = complete;
+    }
+
     pub async fn close(&self) {
         self.inner.write().await.index.close_fd();
     }
@@ -889,6 +902,7 @@ impl LocalHnswSegmentWriter {
                                 id_map,
                                 index_init: true,
                                 deleted: false,
+                                replay_complete: false,
                                 failed: false,
                                 deleted_on_load: inspection
                                     .mapped_deleted_labels
@@ -945,6 +959,7 @@ impl LocalHnswSegmentWriter {
                             id_map: IdMap::new(dimensionality),
                             index_init: true,
                             deleted: false,
+                            replay_complete: false,
                             failed: false,
                             deleted_on_load: HashSet::new(),
                             #[cfg(test)]
@@ -986,6 +1001,7 @@ impl LocalHnswSegmentWriter {
                             id_map: IdMap::new(dimensionality),
                             index_init: true,
                             deleted: false,
+                            replay_complete: false,
                             failed: false,
                             deleted_on_load: HashSet::new(),
                             #[cfg(test)]
@@ -1567,6 +1583,7 @@ mod tests {
                     id_map: IdMap::new(2),
                     index_init: true,
                     deleted: false,
+                    replay_complete: false,
                     failed: false,
                     deleted_on_load: HashSet::new(),
                     #[cfg(test)]
