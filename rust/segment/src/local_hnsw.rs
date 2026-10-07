@@ -1,4 +1,6 @@
 mod persistence;
+pub(crate) use persistence::validate_checkpoint;
+use persistence::CheckpointFingerprint;
 #[cfg(test)]
 mod regression;
 pub use persistence::{
@@ -247,6 +249,7 @@ impl LocalHnswSegmentReader {
                                 index_init: true,
                                 deleted: false,
                                 replay_complete: false,
+                                verified_checkpoint: None,
                                 failed: false,
                                 deleted_on_load: inspection
                                     .mapped_deleted_labels
@@ -304,6 +307,7 @@ impl LocalHnswSegmentReader {
                             index_init: true,
                             deleted: false,
                             replay_complete: false,
+                            verified_checkpoint: None,
                             failed: false,
                             deleted_on_load: HashSet::new(),
                             #[cfg(test)]
@@ -636,6 +640,7 @@ pub struct Inner {
     index_init: bool,
     deleted: bool,
     replay_complete: bool,
+    verified_checkpoint: Option<CheckpointFingerprint>,
     /// A failed native mutation may have partially modified the shared graph.
     failed: bool,
     // Tombstones already present in native files ahead of the pickle.
@@ -658,6 +663,41 @@ pub struct LocalHnswIndex {
 }
 
 impl LocalHnswIndex {
+    /// Last successfully applied offset in this instance, independent of durability.
+    pub async fn applied_seq_id(&self) -> Result<u64, LocalHnswSegmentWriterError> {
+        let guard = self.inner.read().await;
+        if guard.deleted {
+            return Err(LocalHnswSegmentWriterError::Deleted);
+        }
+        if guard.failed {
+            return Err(LocalHnswSegmentWriterError::HnswIndexLoadError);
+        }
+        Ok(guard.last_seen_seq_id)
+    }
+
+    /// Returns true when a full inspection was needed. Saves invalidate the
+    /// cached fingerprint before touching files and refresh it only on success.
+    pub(crate) async fn validate_persisted_checkpoint(&self, path: &Path) -> std::io::Result<bool> {
+        let mut guard = self.inner.write().await;
+        let before = CheckpointFingerprint::read(path)?;
+        if guard.verified_checkpoint.as_ref() == Some(&before) {
+            return Ok(false);
+        }
+        guard.verified_checkpoint = None;
+        let path = path.to_owned();
+        let inspection =
+            tokio::task::spawn_blocking(move || persistence::validate_checkpoint(&path))
+                .await
+                .map_err(std::io::Error::other)??;
+        if before != inspection {
+            return Err(std::io::Error::other(
+                "checkpoint changed during inspection",
+            ));
+        }
+        guard.verified_checkpoint = Some(inspection);
+        Ok(true)
+    }
+
     /// Whether this loaded instance has successfully replayed its log tail.
     pub async fn replay_complete(&self) -> bool {
         self.inner.read().await.replay_complete
@@ -903,6 +943,7 @@ impl LocalHnswSegmentWriter {
                                 index_init: true,
                                 deleted: false,
                                 replay_complete: false,
+                                verified_checkpoint: None,
                                 failed: false,
                                 deleted_on_load: inspection
                                     .mapped_deleted_labels
@@ -960,6 +1001,7 @@ impl LocalHnswSegmentWriter {
                             index_init: true,
                             deleted: false,
                             replay_complete: false,
+                            verified_checkpoint: None,
                             failed: false,
                             deleted_on_load: HashSet::new(),
                             #[cfg(test)]
@@ -1002,6 +1044,7 @@ impl LocalHnswSegmentWriter {
                             index_init: true,
                             deleted: false,
                             replay_complete: false,
+                            verified_checkpoint: None,
                             failed: false,
                             deleted_on_load: HashSet::new(),
                             #[cfg(test)]
@@ -1040,7 +1083,10 @@ impl LocalHnswSegmentWriter {
             .checked_add(1)
             .ok_or(LocalHnswSegmentWriterError::LabelExhausted)?;
 
-        if log_chunk.is_empty() {
+        if log_chunk.is_empty()
+            && !(guard.persist_path.is_some()
+                && guard.num_elements_since_last_persist >= guard.sync_threshold as u64)
+        {
             return Ok(next_label);
         }
         // Validate the entire batch before changing either the ID map or HNSW.
@@ -1268,6 +1314,11 @@ async fn persist(
     }
     if let Some(path) = guard.persist_path.clone() {
         guard.id_map.checkpoint_seq_id = Some(guard.last_seen_seq_id);
+        // Retain validation only across our own successful writes. Unexpected
+        // file changes and any failed save require another complete inspection.
+        let verified = guard.verified_checkpoint.take().is_some_and(|previous| {
+            CheckpointFingerprint::read(Path::new(&path)).is_ok_and(|current| current == previous)
+        });
         let path = path.as_str();
         // Eviction may close the files while callers retain this index. The
         // write guard serializes reopening and saving with eviction/deletion.
@@ -1302,6 +1353,9 @@ async fn persist(
         sync_dir(Path::new(path))?;
         if let Some(parent) = Path::new(path).parent() {
             sync_dir(parent)?;
+        }
+        if verified {
+            guard.verified_checkpoint = Some(CheckpointFingerprint::read(Path::new(path))?);
         }
     }
     Ok(guard)
@@ -1584,6 +1638,7 @@ mod tests {
                     index_init: true,
                     deleted: false,
                     replay_complete: false,
+                    verified_checkpoint: None,
                     failed: false,
                     deleted_on_load: HashSet::new(),
                     #[cfg(test)]
